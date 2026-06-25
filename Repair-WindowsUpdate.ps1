@@ -1,121 +1,164 @@
-<#
-.SYNOPSIS
-Diagnoses and repairs common Windows Update component problems.
-
-.DESCRIPTION
-The default run records update services, recent update events and pending
-restart indicators. Use -Repair to stop update services, preserve the existing
-update caches by renaming them, and restart the services. No restart occurs.
-#>
-[CmdletBinding(SupportsShouldProcess = $true)]
+#requires -Version 5.1
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$Repair,
-    [string]$LogRoot = "$env:ProgramData\WindowsUpdateRepair\Logs"
+    [ValidateNotNullOrEmpty()][string]$LogRoot = "$env:ProgramData\WindowsUpdateRepair\Logs"
 )
 
-Set-StrictMode -Version 2.0
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $runPath = Join-Path $LogRoot (Get-Date -Format 'yyyyMMdd_HHmmss')
 $serviceNames = @('bits','wuauserv','cryptsvc','msiserver')
 $warnings = New-Object System.Collections.Generic.List[string]
-$transcript = $false
+$transcriptStarted = $false
 
-function Test-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator)
+function Add-WarningRecord([string]$Message) {
+    $script:warnings.Add($Message)
+    Write-Warning $Message
 }
 
-function Save-Diagnostics {
-    Get-CimInstance Win32_OperatingSystem |
-        Select-Object Caption,Version,BuildNumber,LastBootUpTime |
-        Export-Csv (Join-Path $runPath 'OperatingSystem.csv') -NoTypeInformation
+function Test-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
+function Get-ServiceSnapshot {
+    foreach ($name in $serviceNames) {
+        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($service) {
+            [pscustomobject]@{
+                Name = $service.Name
+                WasRunning = ($service.Status -eq 'Running')
+                StartType = [string]$service.StartType
+            }
+        }
+        else {
+            Add-WarningRecord "Service '$name' is unavailable."
+        }
+    }
+}
+
+function Restore-ServiceSnapshot([object[]]$Snapshot) {
+    foreach ($item in $Snapshot) {
+        try {
+            $service = Get-Service -Name $item.Name -ErrorAction Stop
+            if ($item.WasRunning -and $service.Status -ne 'Running') {
+                Start-Service -Name $item.Name -ErrorAction Stop
+            }
+            elseif (-not $item.WasRunning -and $service.Status -eq 'Running') {
+                Stop-Service -Name $item.Name -Force -ErrorAction Stop
+            }
+        }
+        catch {
+            Add-WarningRecord "Could not restore '$($item.Name)' runtime state: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Save-Diagnostics([string]$Prefix) {
     Get-Service -Name $serviceNames -ErrorAction SilentlyContinue |
         Select-Object Name,Status,StartType |
-        Export-Csv (Join-Path $runPath 'UpdateServices.csv') -NoTypeInformation
+        Export-Csv (Join-Path $runPath "${Prefix}_Services.csv") -NoTypeInformation -Encoding UTF8
 
     Get-HotFix -ErrorAction SilentlyContinue |
         Sort-Object InstalledOn -Descending |
         Select-Object -First 50 HotFixID,Description,InstalledBy,InstalledOn |
-        Export-Csv (Join-Path $runPath 'RecentHotfixes.csv') -NoTypeInformation
+        Export-Csv (Join-Path $runPath "${Prefix}_Hotfixes.csv") -NoTypeInformation -Encoding UTF8
 
+    $pendingRename = $false
     try {
-        Get-WinEvent -FilterHashtable @{
-            LogName='System'
-            ProviderName='Microsoft-Windows-WindowsUpdateClient'
-            StartTime=(Get-Date).AddDays(-14)
-        } -MaxEvents 200 -ErrorAction Stop |
-            Select-Object TimeCreated,Id,LevelDisplayName,Message |
-            Export-Csv (Join-Path $runPath 'WindowsUpdateEvents.csv') -NoTypeInformation
+        $value = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
+            -Name PendingFileRenameOperations -ErrorAction Stop
+        $pendingRename = $null -ne $value.PendingFileRenameOperations
     }
-    catch {
-        $warnings.Add("Update event collection: $($_.Exception.Message)")
-    }
+    catch {}
 
     [pscustomobject]@{
-        ComponentBasedServicing = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        ComponentServicing = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         WindowsUpdate = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    } | ConvertTo-Json | Out-File (Join-Path $runPath 'PendingRestart.json') -Encoding UTF8
+        PendingFileRename = $pendingRename
+    } | ConvertTo-Json | Out-File (Join-Path $runPath "${Prefix}_PendingRestart.json") -Encoding UTF8
+}
+
+function Invoke-UpdateScan {
+    try {
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $started = Get-Date
+        $result = $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+        $succeeded = [int]$result.ResultCode -in 2,3
+
+        [pscustomobject]@{
+            Method = 'Windows Update Agent COM API'
+            StartedAt = $started
+            CompletedAt = Get-Date
+            ResultCode = [string]$result.ResultCode
+            PendingUpdates = $result.Updates.Count
+            RebootRequired = [bool]$result.RebootRequired
+            Succeeded = $succeeded
+        } | ConvertTo-Json | Out-File (Join-Path $runPath 'UpdateScan.json') -Encoding UTF8
+
+        if (-not $succeeded) {
+            Add-WarningRecord "Update scan returned result code $($result.ResultCode)."
+        }
+    }
+    catch {
+        Add-WarningRecord "Synchronous update scan failed: $($_.Exception.Message)"
+    }
 }
 
 try {
     if ($env:OS -ne 'Windows_NT') { throw 'Windows is required.' }
     if (-not (Test-Admin)) { throw 'Run PowerShell as Administrator.' }
 
-    New-Item -Path $runPath -ItemType Directory -Force | Out-Null
+    New-Item $runPath -ItemType Directory -Force | Out-Null
     Start-Transcript -Path (Join-Path $runPath 'Transcript.txt') -Force | Out-Null
-    $transcript = $true
+    $transcriptStarted = $true
+    Save-Diagnostics Before
 
-    Save-Diagnostics
-
-    if ($Repair -and $PSCmdlet.ShouldProcess('Windows Update components','Reset update caches and restart services')) {
-        foreach ($name in $serviceNames) {
-            $service = Get-Service -Name $name -ErrorAction SilentlyContinue
-            if ($service -and $service.Status -ne 'Stopped') {
-                try { Stop-Service -Name $name -Force -ErrorAction Stop }
-                catch { $warnings.Add("Could not stop $name: $($_.Exception.Message)") }
+    if ($Repair -and $PSCmdlet.ShouldProcess('Windows Update components','Reset caches and run a synchronous scan')) {
+        $snapshot = @(Get-ServiceSnapshot)
+        try {
+            foreach ($item in $snapshot) {
+                $service = Get-Service -Name $item.Name
+                if ($service.Status -ne 'Stopped') {
+                    Stop-Service -Name $item.Name -Force -ErrorAction Stop
+                    $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(30))
+                }
             }
-        }
 
-        $suffix = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $cachePaths = @(
-            "$env:SystemRoot\SoftwareDistribution",
-            "$env:SystemRoot\System32\catroot2"
-        )
-
-        foreach ($cache in $cachePaths) {
-            if (Test-Path $cache) {
-                $backupName = (Split-Path $cache -Leaf) + ".backup_$suffix"
-                try { Rename-Item -Path $cache -NewName $backupName -ErrorAction Stop }
-                catch { $warnings.Add("Could not preserve $cache: $($_.Exception.Message)") }
+            $suffix = Get-Date -Format 'yyyyMMdd_HHmmss'
+            foreach ($cache in @("$env:SystemRoot\SoftwareDistribution","$env:SystemRoot\System32\catroot2")) {
+                if (Test-Path -LiteralPath $cache) {
+                    $target = "${cache}.backup_${suffix}"
+                    if (Test-Path -LiteralPath $target) { throw "Backup already exists: $target" }
+                    Move-Item -LiteralPath $cache -Destination $target -ErrorAction Stop
+                }
             }
+
+            foreach ($name in @('cryptsvc','bits','wuauserv')) {
+                if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+                    Start-Service -Name $name -ErrorAction Stop
+                }
+            }
+            Invoke-UpdateScan
         }
-
-        foreach ($name in @('cryptsvc','bits','wuauserv','msiserver')) {
-            try { Start-Service -Name $name -ErrorAction Stop }
-            catch { $warnings.Add("Could not start $name: $($_.Exception.Message)") }
+        finally {
+            Restore-ServiceSnapshot $snapshot
         }
-
-        try { Start-Process -FilePath 'UsoClient.exe' -ArgumentList 'StartScan' -WindowStyle Hidden }
-        catch { $warnings.Add("Update scan trigger: $($_.Exception.Message)") }
-
-        Save-Diagnostics
+        Save-Diagnostics After
     }
 
     $warnings | Out-File (Join-Path $runPath 'Warnings.txt') -Encoding UTF8
-    if ($transcript) { Stop-Transcript | Out-Null; $transcript = $false }
+    Stop-Transcript | Out-Null
+    $transcriptStarted = $false
 
-    if ($warnings.Count -gt 0) {
-        Write-Host "[WARN] Completed with $($warnings.Count) warning(s). Logs: $runPath" -ForegroundColor Yellow
-        exit 2
-    }
-
-    Write-Host "[OK] Completed. Logs: $runPath" -ForegroundColor Green
+    if ($warnings.Count -gt 0) { exit 2 }
     exit 0
 }
 catch {
-    if ($transcript) { try { Stop-Transcript | Out-Null } catch { } }
+    if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch {} }
     Write-Error $_.Exception.Message
     exit 1
 }
