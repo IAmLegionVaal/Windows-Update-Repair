@@ -87,20 +87,32 @@ function Invoke-UpdateScan {
         $searcher = $session.CreateUpdateSearcher()
         $started = Get-Date
         $result = $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
-        $succeeded = [int]$result.ResultCode -in 2,3
+        $resultCode = [int]$result.ResultCode
+        $warningCount = if ($null -ne $result.Warnings) { [int]$result.Warnings.Count } else { 0 }
+        $succeeded = ($resultCode -eq 2 -and $warningCount -eq 0)
 
         [pscustomobject]@{
             Method = 'Windows Update Agent COM API'
             StartedAt = $started
             CompletedAt = Get-Date
             ResultCode = [string]$result.ResultCode
-            PendingUpdates = $result.Updates.Count
-            RebootRequired = [bool]$result.RebootRequired
+            PendingUpdates = [int]$result.Updates.Count
+            WarningCount = $warningCount
             Succeeded = $succeeded
         } | ConvertTo-Json | Out-File (Join-Path $runPath 'UpdateScan.json') -Encoding UTF8
 
-        if (-not $succeeded) {
-            Add-WarningRecord "Update scan returned result code $($result.ResultCode)."
+        switch ($resultCode) {
+            2 {
+                if ($warningCount -gt 0) {
+                    Add-WarningRecord "Update scan completed with $warningCount warning(s). Review UpdateScan.json."
+                }
+            }
+            3 {
+                Add-WarningRecord 'Update scan succeeded with errors; the result set may be incomplete.'
+            }
+            default {
+                Add-WarningRecord "Update scan returned result code $($result.ResultCode)."
+            }
         }
     }
     catch {
